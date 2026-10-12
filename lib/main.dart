@@ -5,12 +5,17 @@ import 'package:flutter/material.dart';
 
 import 'app_services.dart';
 import 'app_storage.dart';
+import 'cloud_storage.dart';
 import 'product_data.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final storage = await PersistentStateStorage.create();
-  final state = AppState(storage: storage);
+  final localStorage = await PersistentLocalStateStorage.create();
+  final cloudStorage = await FirebaseCloudStateStorage.create();
+  final state = AppState(
+    localStorage: localStorage,
+    cloudStorage: cloudStorage,
+  );
   await state.restoreState();
   runApp(SimpleStoreApp(initialState: state));
 }
@@ -98,8 +103,11 @@ enum AppSection { home, search, comparison, favorites, history }
 class AppState extends ChangeNotifier {
   // ── Servicios compartidos ───────────────────────────────────────────────────
   final SearchService _searchService = const SearchService();
-  final StateStorage _storage;
-  Timer? _saveTimer;
+  final LocalStateStorage _localStorage;
+  final CloudStateStorage _cloudStorage;
+  Timer? _localSaveTimer;
+  Timer? _cloudSaveTimer;
+  bool _isDisposed = false;
 
   // ── Navegación y apariencia ─────────────────────────────────────────────────
   AppSection section = AppSection.home;
@@ -120,9 +128,35 @@ class AppState extends ChangeNotifier {
   final comparisonIds = <String>{};
   final history = <SearchRecord>[];
 
+  // ── Estado de la sincronización remota ──────────────────────────────────────
+  bool cloudSynced = false;
+  String? cloudError;
+
+  CloudAccount? get account => _cloudStorage.account;
+
+  String get accountName => account?.displayName ?? 'Sin cuenta';
+
+  String get accountInitials =>
+      account?.initials.isNotEmpty == true ? account!.initials : '--';
+
+  String get cloudStatusLabel {
+    if (!_cloudStorage.isAvailable) return 'Firebase pendiente';
+    if (cloudError != null) return 'Error de sincronización';
+    return cloudSynced ? 'Sincronizado' : 'Sincronizando…';
+  }
+
+  bool get hasCloudError => !_cloudStorage.isAvailable || cloudError != null;
+
+  String get cloudStatusDetail => cloudError ?? _cloudStorage.unavailableReason;
+
   // ── Inicialización ───────────────────────────────────────────────────────────
-  AppState({StateStorage? storage})
-    : _storage = storage ?? MemoryStateStorage();
+  AppState({LocalStateStorage? localStorage, CloudStateStorage? cloudStorage})
+    : _localStorage = localStorage ?? MemoryLocalStateStorage(),
+      _cloudStorage =
+          cloudStorage ??
+          const DisabledCloudStateStorage(
+            'Firebase no fue proporcionado a esta instancia.',
+          );
 
   // ── Acciones globales ───────────────────────────────────────────────────────
   void navigate(AppSection next) {
@@ -135,69 +169,117 @@ class AppState extends ChangeNotifier {
     if (next == AppSection.search && results.isEmpty) {
       results = _searchService.search(query, filters);
     }
-    _refresh();
+    _refreshLocal();
   }
 
   void toggleTheme() {
     themeMode = themeMode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
-    _refresh();
+    _refreshLocal();
   }
 
-  // ── Función interna para acciones ubicadas en otros bloques ─────────────────
-  void _refresh() {
+  // ── Funciones internas para acciones ubicadas en otros bloques ───────────────
+  void _refreshLocal() {
+    _scheduleLocalSave();
     notifyListeners();
-    _scheduleSave();
   }
 
-  void _saveWithoutRebuild() {
-    _scheduleSave();
+  void _refreshCloud() {
+    _scheduleCloudSave();
+    notifyListeners();
   }
 
-  void _scheduleSave() {
-    _saveTimer?.cancel();
-    _saveTimer = Timer(const Duration(milliseconds: 300), persistState);
+  void _refreshLocalAndCloud() {
+    _scheduleLocalSave();
+    _scheduleCloudSave();
+    notifyListeners();
   }
 
-  Future<void> persistState() async {
-    _saveTimer?.cancel();
-    await _storage.write(jsonEncode(toStateJson()));
+  void _saveLocalWithoutRebuild() {
+    _scheduleLocalSave();
+  }
+
+  void _scheduleLocalSave() {
+    _localSaveTimer?.cancel();
+    _localSaveTimer = Timer(
+      const Duration(milliseconds: 300),
+      () => unawaited(persistLocalState()),
+    );
+  }
+
+  void _scheduleCloudSave() {
+    if (!_cloudStorage.isAvailable) return;
+    cloudSynced = false;
+    _cloudSaveTimer?.cancel();
+    _cloudSaveTimer = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(persistCloudState()),
+    );
   }
 
   @override
   void dispose() {
-    _saveTimer?.cancel();
-    unawaited(persistState());
+    _isDisposed = true;
+    _localSaveTimer?.cancel();
+    _cloudSaveTimer?.cancel();
+    unawaited(persistLocalState());
+    unawaited(persistCloudState());
     super.dispose();
   }
 }
 
 // =============================================================================
-// BLOQUE 03 · PERSISTENCIA DEL ESTADO EN JSON
+// BLOQUE 03 · PERSISTENCIA LOCAL Y REMOTA EN JSON
 // =============================================================================
 
 extension StatePersistence on AppState {
-  // ── Lectura del JSON al iniciar la aplicación ────────────────────────────────
+  // ── Lectura separada de ambos JSON al iniciar ────────────────────────────────
   Future<void> restoreState() async {
-    final savedJson = await _storage.read();
-    if (savedJson == null || savedJson.isEmpty) return;
-
+    var restoredLegacyCloudData = false;
     try {
-      final decoded = jsonDecode(savedJson);
-      if (decoded is! Map<String, dynamic>) return;
-      _restoreAppState(decoded);
-      results = section == AppSection.search
-          ? _searchService.search(query, filters)
-          : const [];
+      final savedLocalJson = await _localStorage.read();
+      if (savedLocalJson != null && savedLocalJson.isNotEmpty) {
+        final decoded = jsonDecode(savedLocalJson);
+        if (decoded is Map<String, dynamic>) {
+          _restoreLocalState(decoded);
+          restoredLegacyCloudData = _restoreLegacyCloudState(decoded);
+        }
+      }
     } catch (_) {
-      // Si el JSON está dañado se conservan los valores iniciales seguros.
-      await persistState();
+      await persistLocalState();
     }
+
+    if (_cloudStorage.isAvailable) {
+      try {
+        final savedCloudJson = await _cloudStorage.read();
+        if (savedCloudJson != null) {
+          _restoreCloudState(savedCloudJson);
+        } else if (restoredLegacyCloudData) {
+          await persistCloudState();
+        }
+        cloudSynced = true;
+      } catch (error) {
+        cloudError = '$error';
+      }
+    }
+
+    results = section == AppSection.search
+        ? _searchService.search(query, filters)
+        : const [];
+
+    // Reescribe la clave anterior con el formato local v2 ya separado.
+    await persistLocalState();
   }
 
-  // ── Escritura de todo el estado serializable ────────────────────────────────
-  Map<String, dynamic> toStateJson() {
+  // ── Escritura local: interfaz, borradores y trabajo transitorio ───────────────
+  Future<void> persistLocalState() async {
+    _localSaveTimer?.cancel();
+    await _localStorage.write(jsonEncode(toLocalStateJson()));
+  }
+
+  Map<String, dynamic> toLocalStateJson() {
     return {
-      'version': 1,
+      'version': 2,
+      'storage': 'local',
       'app': {'section': section.name, 'themeMode': themeMode.name},
       'screens': {
         'home': {'searchDraft': homeSearchDraft, 'urlDraft': homeUrlDraft},
@@ -214,32 +296,53 @@ extension StatePersistence on AppState {
           },
         },
         'comparison': {'productIds': comparisonIds.toList()},
-        'favorites': {'productIds': favoriteIds.toList()},
-        'history': {
-          'items': history
-              .take(50)
-              .map(
-                (item) => {
-                  'query': item.query,
-                  'resultCount': item.resultCount,
-                  'createdAt': item.createdAt.toIso8601String(),
-                },
-              )
-              .toList(),
-        },
       },
     };
   }
 
-  // ── Funciones auxiliares de restauración ────────────────────────────────────
-  void _restoreAppState(Map<String, dynamic> json) {
+  // ── Escritura remota: cuenta, favoritos e historial ──────────────────────────
+  Future<void> persistCloudState() async {
+    _cloudSaveTimer?.cancel();
+    if (!_cloudStorage.isAvailable) return;
+
+    try {
+      await _cloudStorage.write(toCloudStateJson());
+      cloudSynced = true;
+      cloudError = null;
+    } catch (error) {
+      cloudSynced = false;
+      cloudError = '$error';
+    }
+    if (!_isDisposed) notifyListeners();
+  }
+
+  Map<String, dynamic> toCloudStateJson() {
+    return {
+      'version': 1,
+      'storage': 'cloud',
+      'favorites': {'productIds': favoriteIds.toList()},
+      'history': {
+        'items': history
+            .take(50)
+            .map(
+              (item) => {
+                'query': item.query,
+                'resultCount': item.resultCount,
+                'createdAt': item.createdAt.toIso8601String(),
+              },
+            )
+            .toList(),
+      },
+    };
+  }
+
+  // ── Funciones auxiliares de restauración local ───────────────────────────────
+  void _restoreLocalState(Map<String, dynamic> json) {
     final app = _map(json['app']);
     final screens = _map(json['screens']);
     final home = _map(screens['home']);
     final search = _map(screens['search']);
     final comparison = _map(screens['comparison']);
-    final favoritesJson = _map(screens['favorites']);
-    final historyJson = _map(screens['history']);
 
     section = _enumByName(AppSection.values, app['section'], AppSection.home);
     themeMode = _enumByName(
@@ -257,6 +360,14 @@ extension StatePersistence on AppState {
     comparisonIds
       ..clear()
       ..addAll(_stringSet(comparison['productIds']).intersection(validIds));
+  }
+
+  // ── Funciones auxiliares de restauración remota ──────────────────────────────
+  void _restoreCloudState(Map<String, dynamic> json) {
+    final favoritesJson = _map(json['favorites']);
+    final historyJson = _map(json['history']);
+    final validIds = mockProducts.map((product) => product.id).toSet();
+
     favoriteIds
       ..clear()
       ..addAll(_stringSet(favoritesJson['productIds']).intersection(validIds));
@@ -264,6 +375,17 @@ extension StatePersistence on AppState {
     history
       ..clear()
       ..addAll(_restoreHistory(historyJson['items']));
+  }
+
+  // Migra una única vez los favoritos y el historial del JSON local v1.
+  bool _restoreLegacyCloudState(Map<String, dynamic> json) {
+    if (json['version'] != 1) return false;
+    final screens = _map(json['screens']);
+    _restoreCloudState({
+      'favorites': _map(screens['favorites']),
+      'history': _map(screens['history']),
+    });
+    return favoriteIds.isNotEmpty || history.isNotEmpty;
   }
 
   SearchFilters _restoreFilters(Map<String, dynamic> json) {
@@ -354,7 +476,9 @@ class _SimpleStoreAppState extends State<SimpleStoreApp>
   @override
   void didChangeAppLifecycleState(AppLifecycleState lifecycleState) {
     if (lifecycleState != AppLifecycleState.resumed) {
-      unawaited(state.persistState());
+      unawaited(
+        Future.wait([state.persistLocalState(), state.persistCloudState()]),
+      );
     }
   }
 
@@ -494,31 +618,40 @@ class AppSidebar extends StatelessWidget {
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    const CircleAvatar(
+                    CircleAvatar(
                       radius: 19,
                       backgroundColor: AppColors.paleBlue,
                       child: Text(
-                        'LC',
-                        style: TextStyle(
+                        state.accountInitials,
+                        style: const TextStyle(
                           color: AppColors.primary,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
                     ),
                     const SizedBox(width: 10),
-                    const Expanded(
+                    Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Lucía',
-                            style: TextStyle(fontWeight: FontWeight.w700),
+                            state.accountName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
-                          Text(
-                            'Sincronizado',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: AppColors.success,
+                          Tooltip(
+                            message: state.cloudStatusDetail,
+                            child: Text(
+                              state.cloudStatusLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: state.hasCloudError
+                                    ? AppColors.danger
+                                    : AppColors.success,
+                              ),
                             ),
                           ),
                         ],
@@ -633,12 +766,12 @@ class NavButton extends StatelessWidget {
 extension HomeDraftActions on AppState {
   void updateHomeSearchDraft(String value) {
     homeSearchDraft = value;
-    _saveWithoutRebuild();
+    _saveLocalWithoutRebuild();
   }
 
   void updateHomeUrlDraft(String value) {
     homeUrlDraft = value;
-    _saveWithoutRebuild();
+    _saveLocalWithoutRebuild();
   }
 }
 
@@ -1001,8 +1134,10 @@ extension SearchActions on AppState {
 
     if (save && query.isNotEmpty) {
       _saveSearchInHistory();
+      _refreshLocalAndCloud();
+      return;
     }
-    _refresh();
+    _refreshLocal();
   }
 
   void applyFilters(SearchFilters value) {
@@ -1016,7 +1151,7 @@ extension SearchActions on AppState {
 
   void updateSearchDraft(String value) {
     searchDraft = value;
-    _saveWithoutRebuild();
+    _saveLocalWithoutRebuild();
   }
 
   // ── Función auxiliar: actualización del historial ───────────────────────────
@@ -1745,12 +1880,12 @@ extension ComparisonActions on AppState {
     } else {
       comparisonIds.add(id);
     }
-    _refresh();
+    _refreshLocal();
   }
 
   void clearComparison() {
     comparisonIds.clear();
-    _refresh();
+    _refreshLocal();
   }
 }
 
@@ -1984,7 +2119,7 @@ extension FavoriteActions on AppState {
 
   void toggleFavorite(String id) {
     favoriteIds.contains(id) ? favoriteIds.remove(id) : favoriteIds.add(id);
-    _refresh();
+    _refreshCloud();
   }
 }
 

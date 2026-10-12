@@ -1,0 +1,48 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function hasValidProfile(userId) {
+      let profile = request.resource.data.profile;
+      return profile.keys().hasOnly([
+          'uid', 'displayName', 'email', 'isAnonymous'
+        ])
+        && profile.uid == userId
+        && profile.displayName is string
+        && profile.email is string
+        && profile.isAnonymous is bool;
+    }
+
+    function hasValidCloudState() {
+      let state = request.resource.data.cloudState;
+      return state.keys().hasOnly([
+          'version', 'storage', 'favorites', 'history'
+        ])
+        && state.version == 1
+        && state.storage == 'cloud'
+        && state.favorites.productIds is list
+        && state.favorites.productIds.size() <= 500
+        && state.history.items is list
+        && state.history.items.size() <= 50;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'profile', 'cloudState', 'updatedAt'
+        ])
+        && hasValidProfile(userId)
+        && hasValidCloudState();
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
